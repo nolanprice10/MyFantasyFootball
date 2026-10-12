@@ -2,12 +2,166 @@ const $app = document.getElementById('app');
 const $sub = document.getElementById('subnav');
 const $top = document.getElementById('topnav');
 let meta;
+const DEFAULT_SCORING = { passYd: 0.04, passTd: 4, int: -2, rushYd: 0.1, rushTd: 6, rec: 1, recYd: 0.1, recTd: 6, fumLost: -2, twoPt: 2 };
+const STAT_KEYS = ['passAtt', 'passCmp', 'passYd', 'passTd', 'int', 'rushAtt', 'rushYd', 'rushTd', 'tgt', 'rec', 'recYd', 'recTd', 'fumLost', 'twoPt'];
+const POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'];
+const USE_SERVER_API = !new URLSearchParams(location.search).has('static') && ['localhost', '127.0.0.1'].includes(location.hostname) && Boolean(location.port);
+const STORAGE_KEY = 'myfantasyfootball-data-v1';
+
+const loadLocalDb = () => {
+  try {
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    return { leagues: data.leagues || [], teams: data.teams || [], players: data.players || [], stats: data.stats || [] };
+  } catch {
+    return { leagues: [], teams: [], players: [], stats: [] };
+  }
+};
+
+function saveLocalDb(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    throw new Error('Browser storage is full. Export a backup or use smaller photos.');
+  }
+}
+
+const makeId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const cleanString = (value, max = 80) => String(value ?? '').trim().slice(0, max);
+const numeric = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+
+function localPoints(stat, scoring) {
+  return Math.round(Object.keys(DEFAULT_SCORING).reduce((sum, key) => sum + numeric(stat[key]) * numeric(scoring[key]), 0) * 100) / 100;
+}
+
+function localPlayer(player, db, league) {
+  const games = db.stats.filter((stat) => stat.playerId === player.id);
+  const totals = Object.fromEntries(STAT_KEYS.map((key) => [key, 0]));
+  let points = 0;
+  games.forEach((game) => {
+    STAT_KEYS.forEach((key) => { totals[key] += numeric(game[key]); });
+    points += localPoints(game, league.scoring);
+  });
+  const team = db.teams.find((item) => item.id === player.teamId);
+  return { ...player, team: team || null, gp: games.length, totals,
+    points: Math.round(points * 100) / 100, avg: games.length ? Math.round(points / games.length * 100) / 100 : 0 };
+}
+
+function localApi(path, opts) {
+  const db = loadLocalDb();
+  const method = opts.method || 'GET';
+  const body = opts.body || {};
+  const leagueMatch = path.match(/^\/leagues\/([^/]+)(?:\/(teams|players))?$/);
+  const playerMatch = path.match(/^\/players\/([^/]+)(?:\/stats)?$/);
+  const statsMatch = path.match(/^\/stats\/([^/]+)$/);
+  let result;
+  const leagueById = (id) => db.leagues.find((item) => item.id === id);
+  const playerById = (id) => db.players.find((item) => item.id === id);
+  const requireLeague = (id) => {
+    const league = leagueById(id);
+    if (!league) throw new Error('League not found');
+    return league;
+  };
+  const requirePlayer = (id) => {
+    const player = playerById(id);
+    if (!player) throw new Error('Player not found');
+    return player;
+  };
+
+  if (path === '/meta' && method === 'GET') {
+    return { positions: POSITIONS, statKeys: STAT_KEYS, defaultScoring: DEFAULT_SCORING,
+      sortKeys: ['points', 'avg', 'passYd', 'rushYd', 'recYd', 'totalYd', 'rec', 'tgt', 'td', 'name'] };
+  }
+  if (path === '/leagues' && method === 'GET') return db.leagues;
+  if (path === '/leagues' && method === 'POST') {
+    const name = cleanString(body.name);
+    if (!name) throw new Error('Name required');
+    result = { id: makeId(), name, sport: cleanString(body.sport) || 'Flag Football', season: cleanString(body.season, 20) || String(new Date().getFullYear()),
+      scoring: { ...DEFAULT_SCORING, ...Object.fromEntries(Object.keys(DEFAULT_SCORING).map((key) => [key, numeric(body.scoring?.[key] ?? DEFAULT_SCORING[key])])) },
+      logo: body.logo || null, defaultSort: body.defaultSort || 'points' };
+    db.leagues.push(result);
+  } else if (leagueMatch) {
+    const [, leagueId, section] = leagueMatch;
+    const league = requireLeague(leagueId);
+    if (!section && method === 'PUT') {
+      if (body.name !== undefined) league.name = cleanString(body.name) || league.name;
+      if (body.sport !== undefined) league.sport = cleanString(body.sport) || league.sport;
+      if (body.season !== undefined) league.season = cleanString(body.season, 20) || league.season;
+      if (body.defaultSort) league.defaultSort = body.defaultSort;
+      if (body.scoring) Object.keys(DEFAULT_SCORING).forEach((key) => { if (key in body.scoring) league.scoring[key] = numeric(body.scoring[key]); });
+      if (body.removeLogo) league.logo = null;
+      if (body.logo) league.logo = body.logo;
+      result = league;
+    } else if (!section && method === 'DELETE') {
+      const playerIds = new Set(db.players.filter((player) => player.leagueId === leagueId).map((player) => player.id));
+      db.leagues = db.leagues.filter((item) => item.id !== leagueId);
+      db.teams = db.teams.filter((item) => item.leagueId !== leagueId);
+      db.players = db.players.filter((item) => item.leagueId !== leagueId);
+      db.stats = db.stats.filter((item) => !playerIds.has(item.playerId));
+    } else if (section === 'teams' && method === 'GET') {
+      return db.teams.filter((team) => team.leagueId === leagueId);
+    } else if (section === 'teams' && method === 'POST') {
+      const name = cleanString(body.name);
+      if (!name) throw new Error('Name required');
+      result = { id: makeId(), leagueId, name, abbr: cleanString(body.abbr, 4).toUpperCase() || name.slice(0, 3).toUpperCase(),
+        color: /^#[0-9a-fA-F]{6}$/.test(body.color) ? body.color : '#c8102e', logo: body.logo || null };
+      db.teams.push(result);
+    } else if (section === 'players' && method === 'GET') {
+      return db.players.filter((player) => player.leagueId === leagueId).map((player) => localPlayer(player, db, league));
+    } else if (section === 'players' && method === 'POST') {
+      const name = cleanString(body.name);
+      if (!name || !POSITIONS.includes(body.position)) throw new Error('Name and valid position required');
+      result = { id: makeId(), leagueId, name, position: body.position, number: cleanString(body.number, 3),
+        teamId: db.teams.some((team) => team.id === body.teamId && team.leagueId === leagueId) ? body.teamId : null,
+        photo: body.photo || null, bio: cleanString(body.bio, 300) };
+      db.players.push(result);
+      result = localPlayer(result, db, league);
+    } else {
+      throw new Error('Request not found');
+    }
+  } else if (playerMatch) {
+    const [, playerId] = playerMatch;
+    const player = requirePlayer(playerId);
+    const league = requireLeague(player.leagueId);
+    if (path.endsWith('/stats') && method === 'POST') {
+      const week = Math.floor(numeric(body.week));
+      if (week < 1 || week > 99) throw new Error('Week must be 1-99');
+      result = { id: makeId(), playerId, week, opponent: cleanString(body.opponent, 30) };
+      STAT_KEYS.forEach((key) => { result[key] = Math.max(['passYd', 'rushYd', 'recYd'].includes(key) ? -999 : 0, numeric(body[key])); });
+      db.stats = db.stats.filter((stat) => !(stat.playerId === playerId && stat.week === week));
+      db.stats.push(result);
+    } else if (path === `/players/${playerId}` && method === 'GET') {
+      const games = db.stats.filter((stat) => stat.playerId === playerId).sort((a, b) => a.week - b.week).map((stat) => ({ ...stat, points: localPoints(stat, league.scoring) }));
+      result = { ...localPlayer(player, db, league), games, league };
+    } else if (path === `/players/${playerId}` && method === 'PUT') {
+      if (body.name !== undefined) player.name = cleanString(body.name) || player.name;
+      if (body.position && POSITIONS.includes(body.position)) player.position = body.position;
+      if (body.number !== undefined) player.number = cleanString(body.number, 3);
+      if (body.bio !== undefined) player.bio = cleanString(body.bio, 300);
+      if (body.teamId !== undefined) player.teamId = db.teams.some((team) => team.id === body.teamId && team.leagueId === league.id) ? body.teamId : null;
+      if (body.photo) player.photo = body.photo;
+      result = localPlayer(player, db, league);
+    } else if (path === `/players/${playerId}` && method === 'DELETE') {
+      db.players = db.players.filter((item) => item.id !== playerId);
+      db.stats = db.stats.filter((item) => item.playerId !== playerId);
+    } else {
+      throw new Error('Request not found');
+    }
+  } else if (statsMatch && method === 'DELETE') {
+    db.stats = db.stats.filter((stat) => stat.id !== statsMatch[1]);
+  } else {
+    throw new Error('Request not found');
+  }
+
+  if (method !== 'GET') saveLocalDb(db);
+  return result ?? null;
+}
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const f1 = (n) => (Math.round(n * 10) / 10).toFixed(1);
 const f2 = (n) => (Math.round(n * 100) / 100).toFixed(2);
 
 async function api(path, opts = {}) {
+  if (!USE_SERVER_API) return localApi(path, opts);
   const res = await fetch('/api' + path, {
     method: opts.method || 'GET',
     headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
@@ -19,10 +173,44 @@ async function api(path, opts = {}) {
   return data;
 }
 
+function downloadBackup() {
+  const backup = { format: 'myfantasyfootball-backup', version: 1, exportedAt: new Date().toISOString(), ...loadLocalDb() };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `myfantasyfootball-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importBackup(file) {
+  const data = JSON.parse(await file.text());
+  if (data.format !== 'myfantasyfootball-backup' || !['leagues', 'teams', 'players', 'stats'].every((key) => Array.isArray(data[key]))) {
+    throw new Error('That file is not a valid MyFantasyFootball backup.');
+  }
+  saveLocalDb({ leagues: data.leagues, teams: data.teams, players: data.players, stats: data.stats });
+  location.hash = '#/';
+  await route();
+}
+
 const fileToDataUrl = (file) => new Promise((resolve, reject) => {
   if (!file) return resolve(null);
   const r = new FileReader();
-  r.onload = () => resolve(r.result);
+  r.onload = () => {
+    if (USE_SERVER_API) return resolve(r.result);
+    const image = new Image();
+    image.onload = () => {
+      const scale = Math.min(1, 640 / Math.max(image.width, image.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+      const webp = canvas.toDataURL('image/webp', 0.8);
+      resolve(webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/jpeg', 0.8));
+    };
+    image.onerror = () => reject(new Error('Could not read that image.'));
+    image.src = r.result;
+  };
   r.onerror = reject;
   r.readAsDataURL(file);
 });
@@ -297,4 +485,14 @@ async function route() {
 }
 
 window.addEventListener('hashchange', route);
+if (!USE_SERVER_API) {
+  document.getElementById('staticNotice').hidden = false;
+  document.getElementById('exportData').onclick = downloadBackup;
+  document.getElementById('importData').onchange = async (event) => {
+    const file = event.target.files[0];
+    if (!file || !confirm('Importing a backup replaces the data saved in this browser. Continue?')) return;
+    try { await importBackup(file); } catch (error) { alert(error.message); }
+    event.target.value = '';
+  };
+}
 route();

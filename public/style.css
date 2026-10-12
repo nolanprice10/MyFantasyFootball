@@ -13,6 +13,9 @@ a:hover { text-decoration: underline; }
 .subnav a { color: #fff; padding: 0 14px; display: flex; align-items: center; font-weight: 600; text-transform: uppercase; font-size: 12px; }
 .subnav a:hover, .subnav a.active { background: rgba(0,0,0,.25); text-decoration: none; }
 .container { max-width: 1100px; margin: 20px auto; padding: 0 12px; }
+.static-notice { max-width: 1076px; margin: 12px auto -8px; padding: 9px 12px; background: #fff8e1; border: 1px solid #e6c65b; border-radius: 3px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; }
+.static-notice[hidden] { display: none; }
+.backup-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 .card { background: #fff; border: 1px solid var(--line); border-radius: 4px; margin-bottom: 16px; }
 .card > h2, .card > .card-head { margin: 0; padding: 10px 14px; background: var(--gray); border-bottom: 1px solid var(--line); font-size: 14px; text-transform: uppercase; letter-spacing: .5px; display: flex; justify-content: space-between; align-items: center; }
 .card-body { padding: 14px; }
@@ -57,4 +60,4 @@ input, select, textarea { font: inherit; padding: 7px 8px; border: 1px solid #bb
 .err { background: #fde8ea; color: var(--red); padding: 8px 12px; border-radius: 3px; margin-bottom: 10px; }
 .watermark { position: fixed; right: 10px; bottom: 8px; font-size: 11px; color: #555; background: rgba(255,255,255,.85); padding: 3px 8px; border-radius: 3px; border: 1px solid var(--line); z-index: 10; }
 .watermark a { color: inherit; }
-@media (max-width: 700px) { .hero { flex-direction: column; text-align: center; } .hero .stats { margin: 0; } }
+@media (max-width: 700px) { .hero { flex-direction: column; text-align: center; } .hero .stats { margin: 0; } .static-notice { margin: 10px 12px 0; align-items: flex-start; flex-direction: column; } }

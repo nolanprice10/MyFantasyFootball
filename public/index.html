@@ -12,6 +12,10 @@
     <nav id="topnav"></nav>
   </header>
   <div id="subnav" class="subnav"></div>
+  <aside id="staticNotice" class="static-notice" hidden>
+    <span>Data is saved only in this browser. Export backups regularly; this site does not sync between users or devices.</span>
+    <span class="backup-actions"><button id="exportData" class="btn small secondary" type="button">Export backup</button><label class="btn small secondary" for="importData">Import backup</label><input id="importData" type="file" accept="application/json,.json" hidden></span>
+  </aside>
   <main id="app" class="container"></main>
   <script src="app.js"></script>
   <div class="watermark">Nolan Price &middot; <a href="mailto:nolangp10@icloud.com">nolangp10@icloud.com</a></div>
