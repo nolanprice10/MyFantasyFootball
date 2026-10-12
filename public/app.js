@@ -296,17 +296,5 @@ async function route() {
   }
 }
 
-function addLeagueFooter(league) {
-  const b = document.createElement('button');
-  b.className = 'btn danger small';
-  b.textContent = 'Delete League';
-  b.onclick = async () => {
-    if (!confirm(`Delete league "${league.name}" and all its players?`)) return;
-    await api(`/leagues/${league.id}`, { method: 'DELETE' });
-    location.hash = '#/';
-  };
-  $app.append(b);
-}
-
 window.addEventListener('hashchange', route);
 route();
