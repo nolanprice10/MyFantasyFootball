@@ -31,13 +31,15 @@ const photo = (p, cls = '') => p.photo
   ? `<img class="avatar ${cls}" src="${esc(p.photo)}" alt="">`
   : `<span class="avatar ${cls}" style="display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:#fff;background:${esc(p.team?.color || '#888')}">${esc(p.name.split(' ').map((w) => w[0]).slice(0, 2).join(''))}</span>`;
 
-const teamTag = (t) => t ? `<span class="tag" style="background:${esc(t.color)}">${esc(t.abbr)}</span>` : '<span class="psub">FA</span>';
+const logoImg = (o, size = 28) => o.logo ? `<img src="${esc(o.logo)}" alt="" style="width:${size}px;height:${size}px;border-radius:4px;object-fit:cover;background:#fff">` : '';
+
+const teamTag = (t) => t ? `<span class="tag" style="background:${esc(t.color)}">${esc(t.abbr)}</span>` : '<span class="psub">&mdash;</span>';
 
 function setNav(league, active) {
   $top.innerHTML = '';
   if (!league) { $sub.innerHTML = ''; return; }
   const tabs = [['players', 'Players'], ['leaders', 'Leaders'], ['teams', 'Teams'], ['add', 'Add Player']];
-  $sub.innerHTML = `<span class="league-name">${esc(league.name)}</span>` +
+  $sub.innerHTML = `<span class="league-name">${logoImg(league, 26)}&nbsp;${esc(league.name)}</span>` +
     tabs.map(([k, l]) => `<a href="#/league/${league.id}/${k}" class="${active === k ? 'active' : ''}">${l}</a>`).join('');
 }
 
@@ -55,7 +57,7 @@ async function viewLeagues() {
   $app.innerHTML = `
     <div class="card"><h2>My Leagues</h2>
       ${leagues.length ? `<div class="grid card-body">${leagues.map((l) => `
-        <a class="card league-card" href="#/league/${l.id}/players"><h3>${esc(l.name)}</h3>
+        <a class="card league-card" href="#/league/${l.id}/players"><h3>${logoImg(l, 36)} ${esc(l.name)}</h3>
         <span class="psub">${esc(l.sport)} &middot; ${esc(l.season)}</span></a>`).join('')}</div>`
         : '<div class="empty">No leagues yet. Create one below.</div>'}
     </div>
@@ -65,6 +67,7 @@ async function viewLeagues() {
           <label>League name<input name="name" required maxlength="80" placeholder="Lincoln High Varsity"></label>
           <label>Sport / type<input name="sport" maxlength="80" placeholder="Flag Football"></label>
           <label>Season<input name="season" maxlength="20" placeholder="2026"></label>
+          <label>Logo (optional)<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label>
         </div>
         <details style="margin-bottom:12px"><summary><b>Scoring settings (optional)</b></summary>
         <div class="row" style="margin-top:10px">${Object.entries(s).map(([k, v]) => `<label>${esc(k)}<input type="number" step="any" name="s_${k}" value="${v}"></label>`).join('')}</div></details>
@@ -76,7 +79,8 @@ async function viewLeagues() {
     const scoring = {};
     for (const k of Object.keys(s)) scoring[k] = fd.get('s_' + k);
     try {
-      const l = await api('/leagues', { method: 'POST', body: { name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), scoring } });
+      const logo = await fileToDataUrl(fd.get('logo'));
+      const l = await api('/leagues', { method: 'POST', body: { name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), scoring, logo } });
       location.hash = `#/league/${l.id}/add`;
     } catch (err) { showError(e.target, err.message); }
   };
@@ -139,16 +143,22 @@ async function viewTeams(league) {
   const [teams, players] = await Promise.all([api(`/leagues/${league.id}/teams`), api(`/leagues/${league.id}/players`)]);
   setNav(league, 'teams');
   $app.innerHTML = `<div class="card"><h2>Teams</h2>${teams.length ? `<table><thead><tr><th class="left">Team</th><th>Players</th><th>Total FPTS</th></tr></thead><tbody>
-    ${teams.map((t) => { const ps = players.filter((p) => p.teamId === t.id); return `<tr><td class="left">${teamTag(t)} <b>${esc(t.name)}</b></td><td>${ps.length}</td><td class="pts">${f1(ps.reduce((a, p) => a + p.points, 0))}</td></tr>`; }).join('')}
+    ${teams.map((t) => { const ps = players.filter((p) => p.teamId === t.id); return `<tr><td class="left">${logoImg(t)} ${teamTag(t)} <b>${esc(t.name)}</b></td><td>${ps.length}</td><td class="pts">${f1(ps.reduce((a, p) => a + p.points, 0))}</td></tr>`; }).join('')}
     </tbody></table>` : '<div class="empty">No teams yet.</div>'}</div>
     <div class="card"><h2>Add Team</h2><div class="card-body"><form id="tform"><div class="row">
       <label>Name<input name="name" required maxlength="80"></label>
       <label>Abbr<input name="abbr" maxlength="4"></label>
-      <label>Color<input type="color" name="color" value="#c8102e"></label></div><button class="btn">Add Team</button></form></div></div>`;
+      <label>Color<input type="color" name="color" value="#c8102e"></label>
+      <label>Logo (optional)<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label></div><button class="btn">Add Team</button></form></div></div>`;
   document.getElementById('tform').onsubmit = async (e) => {
     e.preventDefault();
-    const fd = Object.fromEntries(new FormData(e.target));
-    try { await api(`/leagues/${league.id}/teams`, { method: 'POST', body: fd }); viewTeams(league); } catch (err) { showError(e.target, err.message); }
+    const raw = new FormData(e.target);
+    const fd = Object.fromEntries([...raw].filter(([k]) => k !== 'logo'));
+    try {
+      fd.logo = await fileToDataUrl(raw.get('logo'));
+      await api(`/leagues/${league.id}/teams`, { method: 'POST', body: fd });
+      viewTeams(league);
+    } catch (err) { showError(e.target, err.message); }
   };
 }
 
@@ -161,7 +171,7 @@ async function viewAdd(league) {
       <label>Name<input name="name" required maxlength="80"></label>
       <label>Position<select name="position">${meta.positions.map((p) => `<option>${p}</option>`).join('')}</select></label>
       <label>Jersey #<input name="number" maxlength="3"></label>
-      <label>Team<select name="teamId"><option value="">Free agent</option>${teams.map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select></label>
+      ${teams.length ? `<label>Team (optional)<select name="teamId"><option value="">No team</option>${teams.map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select></label>` : ''}
       <label>Photo<input type="file" name="photo" accept="image/png,image/jpeg,image/webp,image/gif"></label>
     </div>
     <label style="margin-bottom:12px">Bio<textarea name="bio" maxlength="300" rows="2"></textarea></label>

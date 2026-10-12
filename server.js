@@ -72,7 +72,7 @@ api.post('/leagues', (req, res) => {
   if (!name) return res.status(400).json({ error: 'Name required' });
   const scoring = { ...DEFAULT_SCORING };
   for (const k of Object.keys(scoring)) if (req.body.scoring && k in req.body.scoring) scoring[k] = num(req.body.scoring[k]);
-  const league = { id: id(), name, sport: str(req.body.sport) || 'Flag Football', season: str(req.body.season, 20) || String(new Date().getFullYear()), scoring };
+  const league = { id: id(), name, sport: str(req.body.sport) || 'Flag Football', season: str(req.body.season, 20) || String(new Date().getFullYear()), scoring, logo: saveImage(req.body.logo) };
   db.leagues.push(league);
   save();
   res.status(201).json(league);
@@ -80,6 +80,8 @@ api.post('/leagues', (req, res) => {
 api.delete('/leagues/:lid', (req, res) => {
   const l = findLeague(req, res); if (!l) return;
   db.players.filter((p) => p.leagueId === l.id).forEach((p) => removeImage(p.photo));
+  db.teams.filter((t) => t.leagueId === l.id).forEach((t) => removeImage(t.logo));
+  removeImage(l.logo);
   const pids = new Set(db.players.filter((p) => p.leagueId === l.id).map((p) => p.id));
   db.stats = db.stats.filter((s) => !pids.has(s.playerId));
   db.players = db.players.filter((p) => p.leagueId !== l.id);
@@ -98,7 +100,7 @@ api.post('/leagues/:lid/teams', (req, res) => {
   const name = str(req.body.name);
   if (!name) return res.status(400).json({ error: 'Name required' });
   const color = /^#[0-9a-fA-F]{6}$/.test(req.body.color) ? req.body.color : '#c8102e';
-  const team = { id: id(), leagueId: req.params.lid, name, abbr: str(req.body.abbr, 4).toUpperCase() || name.slice(0, 3).toUpperCase(), color };
+  const team = { id: id(), leagueId: req.params.lid, name, abbr: str(req.body.abbr, 4).toUpperCase() || name.slice(0, 3).toUpperCase(), color, logo: saveImage(req.body.logo) };
   db.teams.push(team);
   save();
   res.status(201).json(team);
