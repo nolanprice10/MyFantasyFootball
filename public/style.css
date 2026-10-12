@@ -55,4 +55,6 @@ input, select, textarea { font: inherit; padding: 7px 8px; border: 1px solid #bb
 .rank { color: var(--muted); width: 30px; }
 .tag { display: inline-block; padding: 1px 6px; border-radius: 3px; color: #fff; font-size: 11px; font-weight: 700; }
 .err { background: #fde8ea; color: var(--red); padding: 8px 12px; border-radius: 3px; margin-bottom: 10px; }
+.watermark { position: fixed; right: 10px; bottom: 8px; font-size: 11px; color: #555; background: rgba(255,255,255,.85); padding: 3px 8px; border-radius: 3px; border: 1px solid var(--line); z-index: 10; }
+.watermark a { color: inherit; }
 @media (max-width: 700px) { .hero { flex-direction: column; text-align: center; } .hero .stats { margin: 0; } }

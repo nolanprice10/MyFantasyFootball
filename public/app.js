@@ -38,7 +38,7 @@ const teamTag = (t) => t ? `<span class="tag" style="background:${esc(t.color)}"
 function setNav(league, active) {
   $top.innerHTML = '';
   if (!league) { $sub.innerHTML = ''; return; }
-  const tabs = [['players', 'Players'], ['leaders', 'Leaders'], ['teams', 'Teams'], ['add', 'Add Player']];
+  const tabs = [['players', 'Players'], ['leaders', 'Leaders'], ['teams', 'Teams'], ['add', 'Add Player'], ['settings', 'Settings']];
   $sub.innerHTML = `<span class="league-name">${logoImg(league, 26)}&nbsp;${esc(league.name)}</span>` +
     tabs.map(([k, l]) => `<a href="#/league/${league.id}/${k}" class="${active === k ? 'active' : ''}">${l}</a>`).join('');
 }
@@ -91,14 +91,22 @@ const COLS = [
   ['points', 'FPTS'], ['avg', 'AVG'], ['passYd', 'PYD'], ['passTd', 'PTD'], ['int', 'INT'],
   ['rushAtt', 'CAR'], ['rushYd', 'RYD'], ['rushTd', 'RTD'], ['tgt', 'TGT'], ['rec', 'REC'], ['recYd', 'REYD'], ['recTd', 'RETD'],
 ];
-const colVal = (p, k) => (k === 'points' || k === 'avg') ? p[k] : p.totals[k];
+const SORT_OPTIONS = [['points', 'Overall rank (fantasy points)'], ['avg', 'Fantasy points per game'], ['totalYd', 'Total yards'], ['passYd', 'Passing yards'],
+  ['rushYd', 'Rushing yards'], ['recYd', 'Receiving yards'], ['rec', 'Receptions'], ['tgt', 'Targets'], ['td', 'Total touchdowns'], ['name', 'Name (A-Z)']];
+const colVal = (p, k) => {
+  if (k === 'points' || k === 'avg') return p[k];
+  if (k === 'totalYd') return p.totals.passYd + p.totals.rushYd + p.totals.recYd;
+  if (k === 'td') return p.totals.passTd + p.totals.rushTd + p.totals.recTd;
+  return p.totals[k];
+};
+const cmpPlayers = (k) => k === 'name' ? (a, b) => a.name.localeCompare(b.name) : (a, b) => colVal(b, k) - colVal(a, k);
 
 async function viewPlayers(league) {
   const players = await api(`/leagues/${league.id}/players`);
-  let pos = 'ALL', sortKey = 'points', q = '';
+  let pos = 'ALL', sortKey = league.defaultSort || 'points', q = '';
   setNav(league, 'players');
   $app.innerHTML = `<div class="card">
-    <div class="card-head">Players <input id="q" placeholder="Search name..." style="width:200px"></div>
+    <div class="card-head">Players <span><select id="sortsel">${SORT_OPTIONS.map(([k, l]) => `<option value="${k}">Sort: ${l}</option>`).join('')}</select> <input id="q" placeholder="Search name..." style="width:180px"></span></div>
     <div class="filters" id="chips"></div>
     <div class="scroll"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div></div>`;
   const render = () => {
@@ -106,7 +114,7 @@ async function viewPlayers(league) {
     document.getElementById('thead').innerHTML = `<tr><th class="left rank">#</th><th class="left">Player</th><th>Team</th><th>GP</th>` +
       COLS.map(([k, l]) => `<th class="sortable" data-k="${k}">${l}${k === sortKey ? ' ▼' : ''}</th>`).join('') + '</tr>';
     const rows = players.filter((p) => (pos === 'ALL' || p.position === pos) && p.name.toLowerCase().includes(q))
-      .sort((a, b) => colVal(b, sortKey) - colVal(a, sortKey));
+      .sort(cmpPlayers(sortKey));
     document.getElementById('tbody').innerHTML = rows.length ? rows.map((p, i) => `<tr>
       <td class="left rank">${i + 1}</td>
       <td class="left"><div class="pcell">${photo(p)}<div><a class="pname" href="#/player/${p.id}">${esc(p.name)}</a>
@@ -117,8 +125,11 @@ async function viewPlayers(league) {
   };
   $app.onclick = (e) => {
     if (e.target.dataset.p) { pos = e.target.dataset.p; render(); }
-    if (e.target.dataset.k) { sortKey = e.target.dataset.k; render(); }
+    if (e.target.dataset.k) { sortKey = e.target.dataset.k; document.getElementById('sortsel').value = sortKey; render(); }
   };
+  const sel = document.getElementById('sortsel');
+  sel.value = sortKey;
+  sel.onchange = () => { sortKey = sel.value; render(); };
   document.getElementById('q').oninput = (e) => { q = e.target.value.toLowerCase(); render(); };
   render();
 }
@@ -158,6 +169,43 @@ async function viewTeams(league) {
       fd.logo = await fileToDataUrl(raw.get('logo'));
       await api(`/leagues/${league.id}/teams`, { method: 'POST', body: fd });
       viewTeams(league);
+    } catch (err) { showError(e.target, err.message); }
+  };
+}
+
+/* ---------- League settings ---------- */
+function viewSettings(league) {
+  setNav(league, 'settings');
+  $app.innerHTML = `<div class="card"><h2>League Settings</h2><div class="card-body"><form id="setform">
+    <div class="row">
+      <label>League name<input name="name" required maxlength="80" value="${esc(league.name)}"></label>
+      <label>Sport / type<input name="sport" maxlength="80" value="${esc(league.sport)}"></label>
+      <label>Season<input name="season" maxlength="20" value="${esc(league.season)}"></label>
+      <label>Default player sort<select name="defaultSort">${SORT_OPTIONS.map(([k, l]) => `<option value="${k}" ${k === (league.defaultSort || 'points') ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label>Logo<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label>
+    </div>
+    ${league.logo ? `<p>${logoImg(league, 48)} <label style="display:inline-flex;flex-direction:row;align-items:center;gap:6px"><input type="checkbox" name="removeLogo"> Remove logo</label></p>` : ''}
+    <h4>Scoring</h4>
+    <div class="row">${Object.entries(league.scoring).map(([k, v]) => `<label>${esc(k)}<input type="number" step="any" name="s_${k}" value="${v}"></label>`).join('')}</div>
+    <button class="btn">Save Settings</button> <span class="psub">Scoring changes recalculate all fantasy points.</span>
+  </form></div></div>
+  <div class="card"><h2>Danger Zone</h2><div class="card-body"><button class="btn danger" id="dell">Delete League</button> <span class="psub">Removes the league, its teams, players and stats.</span></div></div>`;
+  document.getElementById('dell').onclick = async () => {
+    if (!confirm(`Delete league "${league.name}" and all its players?`)) return;
+    await api(`/leagues/${league.id}`, { method: 'DELETE' });
+    location.hash = '#/';
+  };
+  document.getElementById('setform').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const scoring = {};
+    for (const k of Object.keys(league.scoring)) scoring[k] = fd.get('s_' + k);
+    try {
+      const logo = await fileToDataUrl(fd.get('logo'));
+      await api(`/leagues/${league.id}`, { method: 'PUT', body: {
+        name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), defaultSort: fd.get('defaultSort'),
+        scoring, logo, removeLogo: fd.get('removeLogo') === 'on' } });
+      location.hash = `#/league/${league.id}/players`;
     } catch (err) { showError(e.target, err.message); }
   };
 }
@@ -236,9 +284,8 @@ async function route() {
     if (parts[0] === 'league' && parts[1]) {
       const league = (await api('/leagues')).find((l) => l.id === parts[1]);
       if (!league) return (location.hash = '#/');
-      const view = { players: viewPlayers, leaders: viewLeaders, teams: viewTeams, add: viewAdd }[parts[2] || 'players'] || viewPlayers;
+      const view = { players: viewPlayers, leaders: viewLeaders, teams: viewTeams, add: viewAdd, settings: viewSettings }[parts[2] || 'players'] || viewPlayers;
       await view(league);
-      if (parts[2] === 'players' || !parts[2]) addLeagueFooter(league);
     } else if (parts[0] === 'player' && parts[1]) {
       await viewPlayer(parts[1]);
     } else {

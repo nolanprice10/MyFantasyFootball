@@ -19,6 +19,7 @@ const DEFAULT_SCORING = {
 const STAT_KEYS = ['passAtt', 'passCmp', 'passYd', 'passTd', 'int', 'rushAtt', 'rushYd', 'rushTd',
   'tgt', 'rec', 'recYd', 'recTd', 'fumLost', 'twoPt'];
 const POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'];
+const SORT_KEYS = ['points', 'avg', 'passYd', 'rushYd', 'recYd', 'totalYd', 'rec', 'tgt', 'td', 'name'];
 
 let db = { leagues: [], teams: [], players: [], stats: [] };
 if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
@@ -64,7 +65,7 @@ const findLeague = (req, res) => {
   return l;
 };
 
-api.get('/meta', (_req, res) => res.json({ positions: POSITIONS, statKeys: STAT_KEYS, defaultScoring: DEFAULT_SCORING }));
+api.get('/meta', (_req, res) => res.json({ positions: POSITIONS, statKeys: STAT_KEYS, defaultScoring: DEFAULT_SCORING, sortKeys: SORT_KEYS }));
 
 api.get('/leagues', (_req, res) => res.json(db.leagues));
 api.post('/leagues', (req, res) => {
@@ -72,10 +73,27 @@ api.post('/leagues', (req, res) => {
   if (!name) return res.status(400).json({ error: 'Name required' });
   const scoring = { ...DEFAULT_SCORING };
   for (const k of Object.keys(scoring)) if (req.body.scoring && k in req.body.scoring) scoring[k] = num(req.body.scoring[k]);
-  const league = { id: id(), name, sport: str(req.body.sport) || 'Flag Football', season: str(req.body.season, 20) || String(new Date().getFullYear()), scoring, logo: saveImage(req.body.logo) };
+  const league = { id: id(), name, sport: str(req.body.sport) || 'Flag Football', season: str(req.body.season, 20) || String(new Date().getFullYear()), scoring, logo: saveImage(req.body.logo),
+    defaultSort: SORT_KEYS.includes(req.body.defaultSort) ? req.body.defaultSort : 'points' };
   db.leagues.push(league);
   save();
   res.status(201).json(league);
+});
+api.put('/leagues/:lid', (req, res) => {
+  const l = findLeague(req, res); if (!l) return;
+  const b = req.body;
+  if (b.name !== undefined) l.name = str(b.name) || l.name;
+  if (b.sport !== undefined) l.sport = str(b.sport) || l.sport;
+  if (b.season !== undefined) l.season = str(b.season, 20) || l.season;
+  if (SORT_KEYS.includes(b.defaultSort)) l.defaultSort = b.defaultSort;
+  if (b.scoring) for (const k of Object.keys(DEFAULT_SCORING)) if (k in b.scoring) l.scoring[k] = num(b.scoring[k]);
+  if (b.removeLogo) { removeImage(l.logo); l.logo = null; }
+  if (b.logo) {
+    const url = saveImage(b.logo);
+    if (url) { removeImage(l.logo); l.logo = url; }
+  }
+  save();
+  res.json(l);
 });
 api.delete('/leagues/:lid', (req, res) => {
   const l = findLeague(req, res); if (!l) return;
