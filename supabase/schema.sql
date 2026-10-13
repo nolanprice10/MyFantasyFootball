@@ -122,7 +122,7 @@ alter table public.players enable row level security;
 alter table public.stats enable row level security;
 
 drop policy if exists "members can read leagues" on public.leagues;
-create policy "members can read leagues" on public.leagues for select to authenticated using (public.is_league_member(id));
+create policy "members can read leagues" on public.leagues for select to authenticated using (owner_id = auth.uid() or public.is_league_member(id));
 drop policy if exists "users create owned leagues" on public.leagues;
 create policy "users create owned leagues" on public.leagues for insert to authenticated with check (owner_id = auth.uid());
 drop policy if exists "owners update leagues" on public.leagues;
