@@ -185,7 +185,15 @@ async function api(path, opts = {}) {
   if (!session) throw new Error('Sign in to access league data.');
 
   if (path === '/leagues' && method === 'GET') {
-    return (await dbRequest('leagues?select=*&order=created_at.desc')).map(fromLeague);
+    const memberships = await dbRequest(`league_members?select=league_id&user_id=eq.${currentUser.id}`);
+    const ids = memberships.map((m) => m.league_id);
+    const filter = ids.length ? `or=(owner_id.eq.${currentUser.id},id.in.(${ids.join(',')}))` : `owner_id=eq.${currentUser.id}`;
+    return (await dbRequest(`leagues?select=*&${filter}&order=created_at.desc`)).map(fromLeague);
+  }
+  if (path === '/leagues/search' && method === 'GET') {
+    const term = String(body.q || '').replace(/[*%,()\\]/g, ' ').trim();
+    const filter = `&visibility=eq.public${term ? `&name=ilike.*${encodeURIComponent(term)}*` : ''}`;
+    return (await dbRequest(`leagues?select=id,name,sport,season,logo,owner_id${filter}&order=created_at.desc&limit=30`)).map(fromLeague);
   }
   if (path === '/leagues' && method === 'POST') {
     const row = { ...dbObject(body), owner_id: currentUser.id };
@@ -199,9 +207,24 @@ async function api(path, opts = {}) {
     const code = await dbRequest('rpc/rotate_league_invite', 'POST', { target_league: inviteMatch[1] });
     return { url: `${location.origin}${location.pathname}#/join/${code}` };
   }
+  const followMatch = path.match(/^\/leagues\/([^/]+)\/follow$/);
+  if (followMatch && method === 'POST') { await dbRequest('rpc/follow_league', 'POST', { target_league: followMatch[1] }); return null; }
+  if (followMatch && method === 'DELETE') {
+    await dbRequest(`league_members?league_id=eq.${followMatch[1]}&user_id=eq.${currentUser.id}`, 'DELETE');
+    return null;
+  }
   const leagueMatch = path.match(/^\/leagues\/([^/]+)(?:\/(teams|players))?$/);
   if (leagueMatch) {
     const [, leagueId, section] = leagueMatch;
+    if (!section && method === 'GET') {
+      const [rows, memberRows] = await Promise.all([
+        dbRequest(`leagues?id=eq.${leagueId}&select=*`),
+        dbRequest(`league_members?league_id=eq.${leagueId}&user_id=eq.${currentUser.id}&select=league_id`),
+      ]);
+      if (!rows.length) throw new Error('League not found');
+      const league = fromLeague(rows[0]);
+      return { ...league, isMember: league.isOwner || memberRows.length > 0 };
+    }
     if (!section && method === 'PUT') {
       const patch = dbObject(body);
       delete patch.remove_logo;
@@ -306,13 +329,19 @@ const logoImg = (o, size = 28) => o.logo ? `<img src="${esc(o.logo)}" alt="" sty
 const teamTag = (t) => t ? `<span class="tag" style="background:${esc(t.color)}">${esc(t.abbr)}</span>` : '<span class="psub">&mdash;</span>';
 
 function setNav(league, active) {
-  $top.innerHTML = currentUser ? `<span class="account-email">${esc(currentUser.email)}</span><button class="btn small secondary" id="signout">Sign out</button>` : '';
+  $top.innerHTML = currentUser ? `<a class="navlink" href="#/search">Find Leagues</a><span class="account-email">${esc(currentUser.email)}</span><button class="btn small secondary" id="signout">Sign out</button>` : '';
   document.getElementById('signout')?.addEventListener('click', signOut);
   if (!league) { $sub.innerHTML = ''; return; }
   const tabs = [['players', 'Players'], ['leaders', 'Leaders'], ['teams', 'Teams']];
   if (league.isOwner) tabs.push(['add', 'Add Player'], ['settings', 'Settings']);
-  $sub.innerHTML = `<span class="league-name">${logoImg(league, 26)}&nbsp;${esc(league.name)}</span>` +
-    tabs.map(([k, l]) => `<a href="#/league/${league.id}/${k}" class="${active === k ? 'active' : ''}">${l}</a>`).join('');
+  const follow = !league.isOwner && league.isMember !== undefined
+    ? `<button class="btn small secondary" id="followbtn">${league.isMember ? 'Remove from My Leagues' : 'Add to My Leagues'}</button>` : '';
+  $sub.innerHTML = `<span class="league-name">${logoImg(league, 26)}&nbsp;${esc(league.name)} <span class="role-badge">${league.isOwner ? 'Owner' : 'Viewer'}</span>${league.visibility === 'private' ? ' <span class="role-badge">Private</span>' : ''}</span>` +
+    tabs.map(([k, l]) => `<a href="#/league/${league.id}/${k}" class="${active === k ? 'active' : ''}">${l}</a>`).join('') + follow;
+  document.getElementById('followbtn')?.addEventListener('click', async () => {
+    await api(`/leagues/${league.id}/follow`, { method: league.isMember ? 'DELETE' : 'POST' });
+    await route();
+  });
 }
 
 function viewSetup() {
@@ -385,7 +414,7 @@ async function viewLeagues() {
       ${leagues.length ? `<div class="grid card-body">${leagues.map((l) => `
         <a class="card league-card" href="#/league/${l.id}/players"><h3>${logoImg(l, 36)} ${esc(l.name)}</h3>
         <span class="psub">${esc(l.sport)} &middot; ${esc(l.season)} ${l.isOwner ? '&middot; Owner' : '&middot; Shared with you'}</span></a>`).join('')}</div>`
-        : '<div class="empty">No leagues yet. Create one below.</div>'}
+        : '<div class="empty">No leagues yet. Create one below or <a href="#/search">find a league</a>.</div>'}
     </div>
     <div class="card"><h2>Create a League</h2><div class="card-body">
       <form id="lform">
@@ -393,6 +422,7 @@ async function viewLeagues() {
           <label>League name<input name="name" required maxlength="80" placeholder="Lincoln High Varsity"></label>
           <label>Sport / type<input name="sport" maxlength="80" placeholder="Flag Football"></label>
           <label>Season<input name="season" maxlength="20" placeholder="2026"></label>
+          <label>Visibility<select name="visibility"><option value="public">Public (searchable)</option><option value="private">Private (invite link only)</option></select></label>
           <label>Logo (optional)<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label>
         </div>
         <details style="margin-bottom:12px"><summary><b>Scoring settings (optional)</b></summary>
@@ -406,10 +436,41 @@ async function viewLeagues() {
     for (const k of Object.keys(s)) scoring[k] = fd.get('s_' + k);
     try {
       const logo = await fileToDataUrl(fd.get('logo'));
-      const l = await api('/leagues', { method: 'POST', body: { name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), scoring, logo } });
+      const l = await api('/leagues', { method: 'POST', body: { name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), visibility: fd.get('visibility'), scoring, logo } });
       location.hash = `#/league/${l.id}/add`;
     } catch (err) { showError(e.target, err.message); }
   };
+}
+
+/* ---------- Find leagues ---------- */
+async function viewSearch() {
+  setNav(null);
+  const mine = new Set((await api('/leagues')).map((l) => l.id));
+  $app.innerHTML = `<div class="card"><h2>Find Leagues</h2><div class="card-body">
+    <form id="searchform" class="search-row"><input name="q" placeholder="Search leagues by name..." maxlength="80" aria-label="League name"><button class="btn">Search</button></form>
+    <div id="results"></div></div></div>`;
+  const results = document.getElementById('results');
+  const run = async (q) => {
+    try {
+      const found = await api('/leagues/search', { body: { q } });
+      results.innerHTML = found.length ? `<table><tbody>${found.map((l) => `<tr><td class="left">${logoImg(l, 32)} <a class="pname" href="#/league/${l.id}/players">${esc(l.name)}</a>
+        <span class="psub">${esc(l.sport)} &middot; ${esc(l.season)}</span></td>
+        <td>${l.isOwner ? '<span class="role-badge">Owner</span>' : mine.has(l.id) ? '<span class="role-badge">In My Leagues</span>' : `<button class="btn small secondary" data-follow="${l.id}">Add to My Leagues</button>`}</td></tr>`).join('')}</tbody></table>`
+        : '<div class="empty">No leagues found.</div>';
+    } catch (error) { results.innerHTML = `<div class="err">${esc(error.message)}</div>`; }
+  };
+  document.getElementById('searchform').onsubmit = (e) => { e.preventDefault(); run(new FormData(e.target).get('q')); };
+  $app.onclick = async (e) => {
+    const id = e.target.dataset.follow;
+    if (!id) return;
+    e.target.disabled = true;
+    try {
+      await api(`/leagues/${id}/follow`, { method: 'POST' });
+      mine.add(id);
+      e.target.replaceWith(Object.assign(document.createElement('span'), { className: 'role-badge', textContent: 'In My Leagues' }));
+    } catch (error) { e.target.disabled = false; showError(document.getElementById('searchform'), error.message); }
+  };
+  run('');
 }
 
 /* ---------- Players table ---------- */
@@ -510,6 +571,7 @@ function viewSettings(league) {
       <label>League name<input name="name" required maxlength="80" value="${esc(league.name)}"></label>
       <label>Sport / type<input name="sport" maxlength="80" value="${esc(league.sport)}"></label>
       <label>Season<input name="season" maxlength="20" value="${esc(league.season)}"></label>
+      <label>Visibility<select name="visibility"><option value="public" ${league.visibility !== 'private' ? 'selected' : ''}>Public (searchable)</option><option value="private" ${league.visibility === 'private' ? 'selected' : ''}>Private (invite link only)</option></select></label>
       <label>Default player sort<select name="defaultSort">${SORT_OPTIONS.map(([k, l]) => `<option value="${k}" ${k === (league.defaultSort || 'points') ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <label>Logo<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label>
     </div>
@@ -544,7 +606,7 @@ function viewSettings(league) {
     try {
       const logo = await fileToDataUrl(fd.get('logo'));
       await api(`/leagues/${league.id}`, { method: 'PUT', body: {
-        name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), defaultSort: fd.get('defaultSort'),
+        name: fd.get('name'), sport: fd.get('sport'), season: fd.get('season'), defaultSort: fd.get('defaultSort'), visibility: fd.get('visibility'),
         scoring, logo, removeLogo: fd.get('removeLogo') === 'on' } });
       location.hash = `#/league/${league.id}/players`;
     } catch (err) { showError(e.target, err.message); }
@@ -652,8 +714,9 @@ async function route() {
     if (!meta) meta = await api('/meta');
     const parts = location.hash.replace(/^#\/?/, '').split('/');
     if (parts[0] === 'join' && parts[1]) { await joinLeague(parts[1]); return; }
+    if (parts[0] === 'search') { await viewSearch(); return; }
     if (parts[0] === 'league' && parts[1]) {
-      const league = (await api('/leagues')).find((l) => l.id === parts[1]);
+      const league = await api(`/leagues/${parts[1]}`).catch((error) => { if (error.message === 'League not found') return null; throw error; });
       if (!league) return (location.hash = '#/');
       const view = { players: viewPlayers, leaders: viewLeaders, teams: viewTeams, add: viewAdd, settings: viewSettings }[parts[2] || 'players'] || viewPlayers;
       await view(league);

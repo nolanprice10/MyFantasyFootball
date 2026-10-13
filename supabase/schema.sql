@@ -9,8 +9,11 @@ create table if not exists public.leagues (
   scoring jsonb not null default '{"passYd":0.04,"passTd":4,"int":-2,"rushYd":0.1,"rushTd":6,"rec":1,"recYd":0.1,"recTd":6,"fumLost":-2,"twoPt":2}'::jsonb,
   default_sort text not null default 'points',
   logo text,
+  visibility text not null default 'public' check (visibility in ('public', 'private')),
   created_at timestamptz not null default now()
 );
+
+alter table public.leagues add column if not exists visibility text not null default 'public' check (visibility in ('public', 'private'));
 
 alter table public.leagues drop column if exists invite_code;
 
@@ -85,6 +88,13 @@ as $$
   select exists (select 1 from public.leagues l where l.id = target_league and l.owner_id = auth.uid());
 $$;
 
+create or replace function public.can_view_league(target_league uuid)
+returns boolean language sql stable security definer set search_path = public
+as $$
+  select exists (select 1 from public.leagues l where l.id = target_league and (l.visibility = 'public' or l.owner_id = auth.uid()))
+    or public.is_league_member(target_league);
+$$;
+
 create or replace function public.join_league(invite text)
 returns uuid language plpgsql security definer set search_path = public
 as $$
@@ -122,7 +132,9 @@ alter table public.players enable row level security;
 alter table public.stats enable row level security;
 
 drop policy if exists "members can read leagues" on public.leagues;
-create policy "members can read leagues" on public.leagues for select to authenticated using (owner_id = auth.uid() or public.is_league_member(id));
+drop policy if exists "signed in users read leagues" on public.leagues;
+drop policy if exists "readable leagues" on public.leagues;
+create policy "readable leagues" on public.leagues for select to authenticated using (visibility = 'public' or owner_id = auth.uid() or public.is_league_member(id));
 drop policy if exists "users create owned leagues" on public.leagues;
 create policy "users create owned leagues" on public.leagues for insert to authenticated with check (owner_id = auth.uid());
 drop policy if exists "owners update leagues" on public.leagues;
@@ -139,18 +151,24 @@ drop policy if exists "owners read invite codes" on public.league_invites;
 create policy "owners read invite codes" on public.league_invites for select to authenticated using (public.is_league_owner(league_id));
 
 drop policy if exists "members read teams" on public.teams;
-create policy "members read teams" on public.teams for select to authenticated using (public.is_league_member(league_id));
+drop policy if exists "signed in users read teams" on public.teams;
+drop policy if exists "readable teams" on public.teams;
+create policy "readable teams" on public.teams for select to authenticated using (public.can_view_league(league_id));
 drop policy if exists "owners manage teams" on public.teams;
 create policy "owners manage teams" on public.teams for all to authenticated using (public.is_league_owner(league_id)) with check (public.is_league_owner(league_id));
 
 drop policy if exists "members read players" on public.players;
-create policy "members read players" on public.players for select to authenticated using (public.is_league_member(league_id));
+drop policy if exists "signed in users read players" on public.players;
+drop policy if exists "readable players" on public.players;
+create policy "readable players" on public.players for select to authenticated using (public.can_view_league(league_id));
 drop policy if exists "owners manage players" on public.players;
 create policy "owners manage players" on public.players for all to authenticated using (public.is_league_owner(league_id)) with check (public.is_league_owner(league_id));
 
 drop policy if exists "members read stats" on public.stats;
-create policy "members read stats" on public.stats for select to authenticated using (
-  exists (select 1 from public.players p where p.id = player_id and public.is_league_member(p.league_id))
+drop policy if exists "signed in users read stats" on public.stats;
+drop policy if exists "readable stats" on public.stats;
+create policy "readable stats" on public.stats for select to authenticated using (
+  exists (select 1 from public.players p where p.id = player_id and public.can_view_league(p.league_id))
 );
 drop policy if exists "owners manage stats" on public.stats;
 create policy "owners manage stats" on public.stats for all to authenticated using (
@@ -159,8 +177,23 @@ create policy "owners manage stats" on public.stats for all to authenticated usi
   exists (select 1 from public.players p where p.id = player_id and public.is_league_owner(p.league_id))
 );
 
+create or replace function public.follow_league(target_league uuid)
+returns void language plpgsql security definer set search_path = public
+as $$
+begin
+  if auth.uid() is null then raise exception 'Sign in is required'; end if;
+  if not public.can_view_league(target_league) then raise exception 'League not found'; end if;
+  if not public.is_league_owner(target_league) then
+    insert into public.league_members (league_id, user_id) values (target_league, auth.uid()) on conflict do nothing;
+  end if;
+end;
+$$;
+
+drop policy if exists "members leave leagues" on public.league_members;
+create policy "members leave leagues" on public.league_members for delete to authenticated using (user_id = auth.uid());
+
 grant usage on schema public to authenticated;
 grant select, insert, update, delete on public.leagues, public.teams, public.players, public.stats to authenticated;
 grant select, delete on public.league_members to authenticated;
 grant select on public.league_invites to authenticated;
-grant execute on function public.is_league_member(uuid), public.is_league_owner(uuid), public.join_league(text), public.rotate_league_invite(uuid) to authenticated;
+grant execute on function public.is_league_member(uuid), public.is_league_owner(uuid), public.join_league(text), public.rotate_league_invite(uuid), public.follow_league(uuid), public.can_view_league(uuid) to authenticated;
