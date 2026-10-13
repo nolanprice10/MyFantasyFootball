@@ -277,7 +277,7 @@ const f1 = (n) => (Math.round(n * 10) / 10).toFixed(1);
 const f2 = (n) => (Math.round(n * 100) / 100).toFixed(2);
 
 const fileToDataUrl = (file) => new Promise((resolve, reject) => {
-  if (!file) return resolve(null);
+  if (!file?.size) return resolve(null); // an empty file input still yields a zero-byte File
   const r = new FileReader();
   r.onload = () => {
     const image = new Image();
