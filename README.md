@@ -5,6 +5,7 @@ An ESPN Fantasy Football-style stats tracker for any league that isn't the NFL: 
 ## Features
 
 - **Leagues:** create any number of leagues, each with a name, sport/type, season, optional logo, and its own scoring settings. Everything is editable later in the league's **Settings** tab, which also holds league deletion.
+- **Accounts and sharing:** users sign up and sign in with email/password. Owners share leagues with invite links; members can view league data, while only the owner can edit it.
 - **Teams (optional):** add real teams (name, abbreviation, color, optional logo). Players can belong to a team or have none; leagues work fine with no teams at all.
 - **Players:** created one at a time with name, position (QB, RB, WR, TE, K, DEF), jersey number, bio, optional team, and optional photo. Players without a photo show team-colored initials.
 - **Stat lines:** each player gets weekly lines covering passing (attempts, completions, yards, TDs, INTs), rushing (carries, yards, TDs), receiving (targets, receptions, yards, TDs), fumbles lost, and 2-point conversions. Saving a week that already exists replaces it.
@@ -19,33 +20,38 @@ An ESPN Fantasy Football-style stats tracker for any league that isn't the NFL: 
 2. Add a player, then add their stat lines on the next screen. Repeat for each player.
 3. View rankings on Players and Leaders; tweak scoring or sorting in Settings.
 
-## Run it
+## Configure Supabase
 
-Requires Node.js.
+Accounts and shared league data use Supabase Auth and Postgres. Before running or deploying the site:
+
+1. Create a Supabase project.
+2. In the Supabase SQL Editor, run [`supabase/schema.sql`](supabase/schema.sql) to create tables, invite functions, and row-level security policies.
+3. Copy the project's **Project URL** and **anon/public key** from Project Settings → API into `supabaseUrl` and `supabaseAnonKey` in [`public/config.js`](public/config.js). The anon key is intended to be public; never put a service-role key in frontend code.
+4. In Authentication settings, configure the site URL and allowed redirect URLs for local development and the eventual GitHub Pages URL. Set a 12-character minimum and require uppercase, lowercase, numbers, and symbols if those password options are available. Enable email confirmation and leaked-password protection if available.
+5. In Authentication's **Rate Limits**, retain the server-side limits or tune them for your users. CAPTCHA requires adding a provider token to the app first; enabling it without that integration will block sign-in/sign-up.
+
+Email/password signup requires at least 12 characters, uppercase and lowercase letters, a number, and a symbol; a live meter shows strength. Repeated failed sign-ins also trigger an escalating per-browser cooldown. That cooldown is only a convenience and can be cleared or bypassed; Supabase Auth rate limits and CAPTCHA are the server-side protections. A confirmed, signed-in account owns leagues it creates. Owners can create or rotate a share link; signed-in users who open it join as read-only members. Only the owner can change league settings, players, teams, or stats. These data restrictions are enforced by Postgres row-level security, not only by hiding controls.
+
+## Run locally
+
+After configuring Supabase, serve `public/` from any static web server. For example, with Python installed:
 
 ```sh
-npm install
-npm start
+python3 -m http.server 8000 --directory public
 ```
 
-Open http://localhost:3000 (set `PORT` to change it).
+Open http://localhost:8000. Add `http://localhost:8000` to Supabase's allowed site and redirect URLs. Do not use `npm start` for this authenticated version; the old Express JSON API is not the shared database.
 
 ## Deploy to GitHub Pages
 
-The site can run as a static app on GitHub Pages. Push the repository to GitHub's `main` branch and enable **Settings → Pages → Build and deployment → GitHub Actions**. The workflow in `.github/workflows/pages.yml` publishes the `public/` directory on each push; `server.js` and Node are not used on Pages.
+Push to the `main` branch and select **Settings → Pages → Build and deployment → GitHub Actions**. The workflow in `.github/workflows/pages.yml` publishes `public/` on each push. Configure the Pages URL as the Supabase site URL and add it to the allowed redirect URLs. `public/config.js` is deployed with the site and contains only the public anon key.
 
-In static mode, leagues, players, stats, and uploaded images are stored in the current browser's local storage. They are not shared with other people or synced across devices. Use **Export backup** and **Import backup** in the notice above the app to move or protect the data. Anyone opening the Pages site starts with their own browser data. For shared league data, run the app with the Express server instead.
+## Tech and remaining scope
 
-## Tech and storage
-
-- Backend: Node + Express (`server.js`) exposing a JSON API under `/api`.
-- Frontend: dependency-free single-page app in `public/` (`index.html`, `app.js`, `style.css`) using hash routing.
-- Server mode data: stored in `data/db.json`; uploaded images in `uploads/` (PNG, JPEG, WebP, GIF, max 5 MB). Both are git-ignored.
-- GitHub Pages mode data: stored in browser local storage and portable through JSON backups.
-
-## Limitations
-
-No user accounts or authentication. On GitHub Pages, data is per-browser and is not shared or synced; on the Express server, anyone who can reach it can edit all data. There are no fantasy owners, drafts, or matchups yet; "teams" are the real teams in a league.
+- Frontend: dependency-free single-page app in `public/` using hash routing and Supabase Auth/PostgREST.
+- Database: Supabase Postgres tables and RLS policies defined in `supabase/schema.sql`.
+- Photos and logos are stored as compressed data URLs in database rows.
+- There are no fantasy owners, drafts, matchups, or member-specific roles yet; league members have view access and the league owner has edit access. Anyone with an active invite link can join until the owner rotates it.
 
 ---
 

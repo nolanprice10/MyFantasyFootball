@@ -5,199 +5,255 @@ let meta;
 const DEFAULT_SCORING = { passYd: 0.04, passTd: 4, int: -2, rushYd: 0.1, rushTd: 6, rec: 1, recYd: 0.1, recTd: 6, fumLost: -2, twoPt: 2 };
 const STAT_KEYS = ['passAtt', 'passCmp', 'passYd', 'passTd', 'int', 'rushAtt', 'rushYd', 'rushTd', 'tgt', 'rec', 'recYd', 'recTd', 'fumLost', 'twoPt'];
 const POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'];
-const USE_SERVER_API = !new URLSearchParams(location.search).has('static') && ['localhost', '127.0.0.1'].includes(location.hostname) && Boolean(location.port);
-const STORAGE_KEY = 'myfantasyfootball-data-v1';
+const APP_CONFIG = window.APP_CONFIG || {};
+const AUTH_STORAGE_KEY = 'myfantasyfootball-auth-v1';
+const AUTH_GUARD_KEY = 'myfantasyfootball-auth-guard-v1';
+let session = null;
+let currentUser = null;
+let authMode = 'login';
+let authNotice = '';
+let inviteUrl = '';
+const snake = (value) => value.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+const camel = (value) => value.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+const dbObject = (value) => Object.fromEntries(Object.entries(value).map(([key, item]) => [snake(key), item]));
+const appObject = (value) => Object.fromEntries(Object.entries(value).map(([key, item]) => [camel(key), item]));
+const numeric = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 
-const loadLocalDb = () => {
-  try {
-    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-    return { leagues: data.leagues || [], teams: data.teams || [], players: data.players || [], stats: data.stats || [] };
-  } catch {
-    return { leagues: [], teams: [], players: [], stats: [] };
+function configured() {
+  return Boolean(APP_CONFIG.supabaseUrl && APP_CONFIG.supabaseAnonKey);
+}
+
+function apiHeaders(accessToken = session?.access_token) {
+  return { apikey: APP_CONFIG.supabaseAnonKey, Authorization: `Bearer ${accessToken || APP_CONFIG.supabaseAnonKey}` };
+}
+
+async function authRequest(path, body) {
+  const response = await fetch(`${APP_CONFIG.supabaseUrl}/auth/v1/${path}`, {
+    method: 'POST', headers: { ...apiHeaders(null), 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.msg || data.message || data.error_description || data.error || 'Authentication failed');
+  return data;
+}
+
+function saveSession(nextSession) {
+  session = nextSession;
+  currentUser = nextSession?.user || null;
+  if (session) localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+  else localStorage.removeItem(AUTH_STORAGE_KEY);
+}
+
+async function restoreSession() {
+  try { session = JSON.parse(localStorage.getItem(AUTH_STORAGE_KEY) || 'null'); } catch { session = null; }
+  if (!session) return;
+  if (session.expires_at && session.expires_at < Date.now() / 1000 + 60) {
+    try {
+      const refreshed = await authRequest('token?grant_type=refresh_token', { refresh_token: session.refresh_token });
+      saveSession({ ...refreshed, expires_at: Date.now() / 1000 + refreshed.expires_in });
+    } catch { saveSession(null); return; }
   }
-};
+  const response = await fetch(`${APP_CONFIG.supabaseUrl}/auth/v1/user`, { headers: apiHeaders() });
+  if (!response.ok) { saveSession(null); return; }
+  currentUser = await response.json();
+  session.user = currentUser;
+  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+}
 
-function saveLocalDb(data) {
+async function signIn(email, password) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const attempts = JSON.parse(localStorage.getItem(AUTH_GUARD_KEY) || '{}');
+  const guard = attempts[normalizedEmail];
+  if (guard?.cooldownUntil > Date.now()) {
+    const seconds = Math.ceil((guard.cooldownUntil - Date.now()) / 1000);
+    throw new Error(`Too many sign-in attempts. Try again in ${seconds} seconds.`);
+  }
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch {
-    throw new Error('Browser storage is full. Export a backup or use smaller photos.');
+    const data = await authRequest('token?grant_type=password', { email: normalizedEmail, password });
+    delete attempts[normalizedEmail];
+    localStorage.setItem(AUTH_GUARD_KEY, JSON.stringify(attempts));
+    saveSession({ ...data, expires_at: Date.now() / 1000 + data.expires_in });
+  } catch (error) {
+    const failures = (guard?.failures || 0) + 1;
+    const cooldown = failures >= 5 ? 5 * 60_000 : failures >= 4 ? 60_000 : failures >= 3 ? 30_000 : 0;
+    attempts[normalizedEmail] = { failures, cooldownUntil: Date.now() + cooldown };
+    localStorage.setItem(AUTH_GUARD_KEY, JSON.stringify(attempts));
+    throw error;
   }
 }
 
-const makeId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-const cleanString = (value, max = 80) => String(value ?? '').trim().slice(0, max);
-const numeric = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+async function signUp(email, password) {
+  if (!passwordChecks(password).every(Boolean)) throw new Error('Use at least 12 characters with uppercase, lowercase, a number, and a symbol.');
+  const data = await authRequest('signup', { email, password });
+  if (data.access_token) saveSession({ ...data, expires_at: Date.now() / 1000 + (data.expires_in || 3600) });
+  else authNotice = 'Check your email to confirm your account, then sign in.';
+}
 
-function localPoints(stat, scoring) {
+function passwordChecks(password) {
+  return [password.length >= 12, /[a-z]/.test(password) && /[A-Z]/.test(password), /\d/.test(password), /[^A-Za-z0-9]/.test(password)];
+}
+
+function passwordStrength(password) {
+  const score = passwordChecks(password).filter(Boolean).length;
+  const label = !password ? 'Password strength' : score < 2 ? 'Weak' : score < 4 ? 'Fair' : 'Strong';
+  return { score, label, valid: score === 4 };
+}
+
+async function signOut() {
+  if (session) await fetch(`${APP_CONFIG.supabaseUrl}/auth/v1/logout`, { method: 'POST', headers: apiHeaders() });
+  saveSession(null);
+  location.hash = '#/';
+  await route();
+}
+
+async function dbRequest(tablePath, method = 'GET', body, prefer = '') {
+  if (session?.expires_at && session.expires_at < Date.now() / 1000 + 60) {
+    try {
+      const refreshed = await authRequest('token?grant_type=refresh_token', { refresh_token: session.refresh_token });
+      saveSession({ ...refreshed, user: refreshed.user || currentUser, expires_at: Date.now() / 1000 + refreshed.expires_in });
+    } catch {
+      saveSession(null);
+      throw new Error('Your session expired. Sign in again.');
+    }
+  }
+  const response = await fetch(`${APP_CONFIG.supabaseUrl}/rest/v1/${tablePath}`, {
+    method,
+    headers: { ...apiHeaders(), 'Content-Type': 'application/json', ...(prefer ? { Prefer: prefer } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    if (['PGRST202', 'PGRST205'].includes(data?.code)) {
+      throw new Error('Supabase database setup is missing. Run supabase/schema.sql in your project SQL Editor, then reload the site.');
+    }
+    throw new Error(data?.message || data?.details || data?.hint || 'Database request failed');
+  }
+  return data;
+}
+
+function fromLeague(row) {
+  return { ...appObject(row), isOwner: row.owner_id === currentUser?.id,
+    scoring: { ...DEFAULT_SCORING, ...(row.scoring || {}) } };
+}
+
+function pointsFor(stat, scoring) {
   return Math.round(Object.keys(DEFAULT_SCORING).reduce((sum, key) => sum + numeric(stat[key]) * numeric(scoring[key]), 0) * 100) / 100;
 }
 
-function localPlayer(player, db, league) {
-  const games = db.stats.filter((stat) => stat.playerId === player.id);
+function scorePlayer(player, games, team, league) {
   const totals = Object.fromEntries(STAT_KEYS.map((key) => [key, 0]));
   let points = 0;
   games.forEach((game) => {
     STAT_KEYS.forEach((key) => { totals[key] += numeric(game[key]); });
-    points += localPoints(game, league.scoring);
+    points += pointsFor(game, league.scoring);
   });
-  const team = db.teams.find((item) => item.id === player.teamId);
-  return { ...player, team: team || null, gp: games.length, totals,
-    points: Math.round(points * 100) / 100, avg: games.length ? Math.round(points / games.length * 100) / 100 : 0 };
+  return { ...player, team: team || null, gp: games.length, totals, points: Math.round(points * 100) / 100,
+    avg: games.length ? Math.round(points / games.length * 100) / 100 : 0 };
 }
 
-function localApi(path, opts) {
-  const db = loadLocalDb();
+async function api(path, opts = {}) {
   const method = opts.method || 'GET';
   const body = opts.body || {};
-  const leagueMatch = path.match(/^\/leagues\/([^/]+)(?:\/(teams|players))?$/);
-  const playerMatch = path.match(/^\/players\/([^/]+)(?:\/stats)?$/);
-  const statsMatch = path.match(/^\/stats\/([^/]+)$/);
-  let result;
-  const leagueById = (id) => db.leagues.find((item) => item.id === id);
-  const playerById = (id) => db.players.find((item) => item.id === id);
-  const requireLeague = (id) => {
-    const league = leagueById(id);
-    if (!league) throw new Error('League not found');
-    return league;
-  };
-  const requirePlayer = (id) => {
-    const player = playerById(id);
-    if (!player) throw new Error('Player not found');
-    return player;
-  };
+  if (path === '/meta') return { positions: POSITIONS, statKeys: STAT_KEYS, defaultScoring: DEFAULT_SCORING,
+    sortKeys: ['points', 'avg', 'passYd', 'rushYd', 'recYd', 'totalYd', 'rec', 'tgt', 'td', 'name'] };
+  if (!session) throw new Error('Sign in to access league data.');
 
-  if (path === '/meta' && method === 'GET') {
-    return { positions: POSITIONS, statKeys: STAT_KEYS, defaultScoring: DEFAULT_SCORING,
-      sortKeys: ['points', 'avg', 'passYd', 'rushYd', 'recYd', 'totalYd', 'rec', 'tgt', 'td', 'name'] };
+  if (path === '/leagues' && method === 'GET') {
+    return (await dbRequest('leagues?select=*&order=created_at.desc')).map(fromLeague);
   }
-  if (path === '/leagues' && method === 'GET') return db.leagues;
   if (path === '/leagues' && method === 'POST') {
-    const name = cleanString(body.name);
-    if (!name) throw new Error('Name required');
-    result = { id: makeId(), name, sport: cleanString(body.sport) || 'Flag Football', season: cleanString(body.season, 20) || String(new Date().getFullYear()),
-      scoring: { ...DEFAULT_SCORING, ...Object.fromEntries(Object.keys(DEFAULT_SCORING).map((key) => [key, numeric(body.scoring?.[key] ?? DEFAULT_SCORING[key])])) },
-      logo: body.logo || null, defaultSort: body.defaultSort || 'points' };
-    db.leagues.push(result);
-  } else if (leagueMatch) {
-    const [, leagueId, section] = leagueMatch;
-    const league = requireLeague(leagueId);
-    if (!section && method === 'PUT') {
-      if (body.name !== undefined) league.name = cleanString(body.name) || league.name;
-      if (body.sport !== undefined) league.sport = cleanString(body.sport) || league.sport;
-      if (body.season !== undefined) league.season = cleanString(body.season, 20) || league.season;
-      if (body.defaultSort) league.defaultSort = body.defaultSort;
-      if (body.scoring) Object.keys(DEFAULT_SCORING).forEach((key) => { if (key in body.scoring) league.scoring[key] = numeric(body.scoring[key]); });
-      if (body.removeLogo) league.logo = null;
-      if (body.logo) league.logo = body.logo;
-      result = league;
-    } else if (!section && method === 'DELETE') {
-      const playerIds = new Set(db.players.filter((player) => player.leagueId === leagueId).map((player) => player.id));
-      db.leagues = db.leagues.filter((item) => item.id !== leagueId);
-      db.teams = db.teams.filter((item) => item.leagueId !== leagueId);
-      db.players = db.players.filter((item) => item.leagueId !== leagueId);
-      db.stats = db.stats.filter((item) => !playerIds.has(item.playerId));
-    } else if (section === 'teams' && method === 'GET') {
-      return db.teams.filter((team) => team.leagueId === leagueId);
-    } else if (section === 'teams' && method === 'POST') {
-      const name = cleanString(body.name);
-      if (!name) throw new Error('Name required');
-      result = { id: makeId(), leagueId, name, abbr: cleanString(body.abbr, 4).toUpperCase() || name.slice(0, 3).toUpperCase(),
-        color: /^#[0-9a-fA-F]{6}$/.test(body.color) ? body.color : '#c8102e', logo: body.logo || null };
-      db.teams.push(result);
-    } else if (section === 'players' && method === 'GET') {
-      return db.players.filter((player) => player.leagueId === leagueId).map((player) => localPlayer(player, db, league));
-    } else if (section === 'players' && method === 'POST') {
-      const name = cleanString(body.name);
-      if (!name || !POSITIONS.includes(body.position)) throw new Error('Name and valid position required');
-      result = { id: makeId(), leagueId, name, position: body.position, number: cleanString(body.number, 3),
-        teamId: db.teams.some((team) => team.id === body.teamId && team.leagueId === leagueId) ? body.teamId : null,
-        photo: body.photo || null, bio: cleanString(body.bio, 300) };
-      db.players.push(result);
-      result = localPlayer(result, db, league);
-    } else {
-      throw new Error('Request not found');
-    }
-  } else if (playerMatch) {
-    const [, playerId] = playerMatch;
-    const player = requirePlayer(playerId);
-    const league = requireLeague(player.leagueId);
-    if (path.endsWith('/stats') && method === 'POST') {
-      const week = Math.floor(numeric(body.week));
-      if (week < 1 || week > 99) throw new Error('Week must be 1-99');
-      result = { id: makeId(), playerId, week, opponent: cleanString(body.opponent, 30) };
-      STAT_KEYS.forEach((key) => { result[key] = Math.max(['passYd', 'rushYd', 'recYd'].includes(key) ? -999 : 0, numeric(body[key])); });
-      db.stats = db.stats.filter((stat) => !(stat.playerId === playerId && stat.week === week));
-      db.stats.push(result);
-    } else if (path === `/players/${playerId}` && method === 'GET') {
-      const games = db.stats.filter((stat) => stat.playerId === playerId).sort((a, b) => a.week - b.week).map((stat) => ({ ...stat, points: localPoints(stat, league.scoring) }));
-      result = { ...localPlayer(player, db, league), games, league };
-    } else if (path === `/players/${playerId}` && method === 'PUT') {
-      if (body.name !== undefined) player.name = cleanString(body.name) || player.name;
-      if (body.position && POSITIONS.includes(body.position)) player.position = body.position;
-      if (body.number !== undefined) player.number = cleanString(body.number, 3);
-      if (body.bio !== undefined) player.bio = cleanString(body.bio, 300);
-      if (body.teamId !== undefined) player.teamId = db.teams.some((team) => team.id === body.teamId && team.leagueId === league.id) ? body.teamId : null;
-      if (body.photo) player.photo = body.photo;
-      result = localPlayer(player, db, league);
-    } else if (path === `/players/${playerId}` && method === 'DELETE') {
-      db.players = db.players.filter((item) => item.id !== playerId);
-      db.stats = db.stats.filter((item) => item.playerId !== playerId);
-    } else {
-      throw new Error('Request not found');
-    }
-  } else if (statsMatch && method === 'DELETE') {
-    db.stats = db.stats.filter((stat) => stat.id !== statsMatch[1]);
-  } else {
-    throw new Error('Request not found');
+    const row = { ...dbObject(body), owner_id: currentUser.id };
+    return fromLeague((await dbRequest('leagues?select=*', 'POST', row, 'return=representation'))[0]);
   }
-
-  if (method !== 'GET') saveLocalDb(db);
-  return result ?? null;
+  if (path === '/leagues/join' && method === 'POST') {
+    return dbRequest('rpc/join_league', 'POST', { invite: body.inviteCode });
+  }
+  const inviteMatch = path.match(/^\/leagues\/([^/]+)\/invite$/);
+  if (inviteMatch && method === 'POST') {
+    const code = await dbRequest('rpc/rotate_league_invite', 'POST', { target_league: inviteMatch[1] });
+    return { url: `${location.origin}${location.pathname}#/join/${code}` };
+  }
+  const leagueMatch = path.match(/^\/leagues\/([^/]+)(?:\/(teams|players))?$/);
+  if (leagueMatch) {
+    const [, leagueId, section] = leagueMatch;
+    if (!section && method === 'PUT') {
+      const patch = dbObject(body);
+      delete patch.remove_logo;
+      if (!body.logo && !body.removeLogo) delete patch.logo;
+      if (body.removeLogo) patch.logo = null;
+      return fromLeague((await dbRequest(`leagues?id=eq.${leagueId}&select=*`, 'PATCH', patch, 'return=representation'))[0]);
+    }
+    if (!section && method === 'DELETE') {
+      await dbRequest(`leagues?id=eq.${leagueId}`, 'DELETE');
+      return null;
+    }
+    if (section === 'teams' && method === 'GET') return (await dbRequest(`teams?league_id=eq.${leagueId}&select=*&order=name`)).map(appObject);
+    if (section === 'teams' && method === 'POST') {
+      return appObject((await dbRequest('teams?select=*', 'POST', dbObject({ ...body, leagueId }), 'return=representation'))[0]);
+    }
+    if (section === 'players' && method === 'GET') {
+      const playerRows = await dbRequest(`players?league_id=eq.${leagueId}&select=*&order=name`);
+      if (!playerRows.length) return [];
+      const playerIds = playerRows.map((player) => player.id);
+      const [teamRows, statRows, leagueRows] = await Promise.all([
+        dbRequest(`teams?league_id=eq.${leagueId}&select=*`),
+        dbRequest(`stats?player_id=in.(${playerIds.join(',')})&select=*`),
+        dbRequest(`leagues?id=eq.${leagueId}&select=*`),
+      ]);
+      const league = fromLeague(leagueRows[0]);
+      return playerRows.map((row) => {
+        const player = appObject(row);
+        const games = statRows.filter((game) => game.player_id === player.id).map(appObject);
+        const team = teamRows.find((item) => item.id === row.team_id);
+        return scorePlayer(player, games, team ? appObject(team) : null, league);
+      });
+    }
+    if (section === 'players' && method === 'POST') {
+      const player = { ...body, leagueId, teamId: body.teamId || null };
+      return appObject((await dbRequest('players?select=*', 'POST', dbObject(player), 'return=representation'))[0]);
+    }
+  }
+  const playerStatsMatch = path.match(/^\/players\/([^/]+)\/stats$/);
+  if (playerStatsMatch && method === 'POST') {
+    const row = dbObject({ ...body, playerId: playerStatsMatch[1] });
+    return appObject((await dbRequest('stats?on_conflict=player_id%2Cweek&select=*', 'POST', row, 'resolution=merge-duplicates,return=representation'))[0]);
+  }
+  const playerMatch = path.match(/^\/players\/([^/]+)$/);
+  if (playerMatch) {
+    const playerId = playerMatch[1];
+    if (method === 'DELETE') { await dbRequest(`players?id=eq.${playerId}`, 'DELETE'); return null; }
+    if (method === 'PUT') {
+      const patch = { ...body };
+      if (patch.teamId !== undefined) patch.teamId = patch.teamId || null;
+      return appObject((await dbRequest(`players?id=eq.${playerId}&select=*`, 'PATCH', dbObject(patch), 'return=representation'))[0]);
+    }
+    const rows = await dbRequest(`players?id=eq.${playerId}&select=*`);
+    if (!rows.length) throw new Error('Player not found');
+    const player = appObject(rows[0]);
+    const [leagueRows, gameRows, teamRows] = await Promise.all([
+      dbRequest(`leagues?id=eq.${player.leagueId}&select=*`),
+      dbRequest(`stats?player_id=eq.${playerId}&select=*&order=week`),
+      dbRequest(`teams?league_id=eq.${player.leagueId}&select=*`),
+    ]);
+    const league = fromLeague(leagueRows[0]);
+    const games = gameRows.map((game) => ({ ...appObject(game), points: pointsFor(appObject(game), league.scoring) }));
+    return { ...scorePlayer(player, games, appObject(teamRows.find((team) => team.id === rows[0].team_id) || {}), league),
+      team: teamRows.find((team) => team.id === rows[0].team_id) ? appObject(teamRows.find((team) => team.id === rows[0].team_id)) : null,
+      games, league };
+  }
+  const statMatch = path.match(/^\/stats\/([^/]+)$/);
+  if (statMatch && method === 'DELETE') { await dbRequest(`stats?id=eq.${statMatch[1]}`, 'DELETE'); return null; }
+  throw new Error('Request not found');
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const f1 = (n) => (Math.round(n * 10) / 10).toFixed(1);
 const f2 = (n) => (Math.round(n * 100) / 100).toFixed(2);
 
-async function api(path, opts = {}) {
-  if (!USE_SERVER_API) return localApi(path, opts);
-  const res = await fetch('/api' + path, {
-    method: opts.method || 'GET',
-    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  if (res.status === 204) return null;
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'Request failed');
-  return data;
-}
-
-function downloadBackup() {
-  const backup = { format: 'myfantasyfootball-backup', version: 1, exportedAt: new Date().toISOString(), ...loadLocalDb() };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `myfantasyfootball-${new Date().toISOString().slice(0, 10)}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-async function importBackup(file) {
-  const data = JSON.parse(await file.text());
-  if (data.format !== 'myfantasyfootball-backup' || !['leagues', 'teams', 'players', 'stats'].every((key) => Array.isArray(data[key]))) {
-    throw new Error('That file is not a valid MyFantasyFootball backup.');
-  }
-  saveLocalDb({ leagues: data.leagues, teams: data.teams, players: data.players, stats: data.stats });
-  location.hash = '#/';
-  await route();
-}
-
 const fileToDataUrl = (file) => new Promise((resolve, reject) => {
   if (!file) return resolve(null);
   const r = new FileReader();
   r.onload = () => {
-    if (USE_SERVER_API) return resolve(r.result);
     const image = new Image();
     image.onload = () => {
       const scale = Math.min(1, 640 / Math.max(image.width, image.height));
@@ -224,11 +280,67 @@ const logoImg = (o, size = 28) => o.logo ? `<img src="${esc(o.logo)}" alt="" sty
 const teamTag = (t) => t ? `<span class="tag" style="background:${esc(t.color)}">${esc(t.abbr)}</span>` : '<span class="psub">&mdash;</span>';
 
 function setNav(league, active) {
-  $top.innerHTML = '';
+  $top.innerHTML = currentUser ? `<span class="account-email">${esc(currentUser.email)}</span><button class="btn small secondary" id="signout">Sign out</button>` : '';
+  document.getElementById('signout')?.addEventListener('click', signOut);
   if (!league) { $sub.innerHTML = ''; return; }
-  const tabs = [['players', 'Players'], ['leaders', 'Leaders'], ['teams', 'Teams'], ['add', 'Add Player'], ['settings', 'Settings']];
+  const tabs = [['players', 'Players'], ['leaders', 'Leaders'], ['teams', 'Teams']];
+  if (league.isOwner) tabs.push(['add', 'Add Player'], ['settings', 'Settings']);
   $sub.innerHTML = `<span class="league-name">${logoImg(league, 26)}&nbsp;${esc(league.name)}</span>` +
     tabs.map(([k, l]) => `<a href="#/league/${league.id}/${k}" class="${active === k ? 'active' : ''}">${l}</a>`).join('');
+}
+
+function viewSetup() {
+  setNav(null);
+  $app.innerHTML = `<div class="card"><h2>Connect Supabase</h2><div class="card-body">
+    <p>Add your Supabase project URL and public anon key to <code>public/config.js</code>, then reload.</p>
+    <p>The public anon key is intended for browser use. Database access is protected by the row-level security policies in <code>supabase/schema.sql</code>.</p>
+  </div></div>`;
+}
+
+function viewAuth() {
+  setNav(null);
+  const isSignup = authMode === 'signup';
+  $app.innerHTML = `<div class="card auth-card"><h2>${isSignup ? 'Create account' : 'Sign in'}</h2><div class="card-body">
+    ${authNotice ? `<p class="psub">${esc(authNotice)}</p>` : ''}
+    <form id="authform"><div class="row"><label>Email<input type="email" name="email" autocomplete="email" required></label>
+      <label>Password<input id="authPassword" type="password" name="password" minlength="${isSignup ? '12' : '8'}" autocomplete="${isSignup ? 'new-password' : 'current-password'}" required></label>
+      ${isSignup ? '<div class="password-help"><div class="password-meter" role="progressbar" aria-label="Password strength" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0"><span id="passwordMeterFill"></span></div><span id="passwordStrengthLabel">Password strength</span><span class="psub">Use 12+ characters with uppercase, lowercase, a number, and a symbol.</span></div>' : ''}</div>
+      <div class="auth-actions"><button class="btn">${isSignup ? 'Create account' : 'Sign in'}</button>
+      <button class="btn secondary" type="button" id="authswitch">${isSignup ? 'I already have an account' : 'Create an account'}</button></div>
+    </form></div></div>`;
+  document.getElementById('authswitch').onclick = () => { authMode = isSignup ? 'login' : 'signup'; authNotice = ''; viewAuth(); };
+  if (isSignup) {
+    const passwordInput = document.getElementById('authPassword');
+    const updateMeter = () => {
+      const strength = passwordStrength(passwordInput.value);
+      const fill = document.getElementById('passwordMeterFill');
+      const meter = fill.parentElement;
+      fill.style.width = `${strength.score * 25}%`;
+      fill.dataset.level = strength.score;
+      meter.setAttribute('aria-valuenow', strength.score);
+      document.getElementById('passwordStrengthLabel').textContent = strength.label;
+    };
+    passwordInput.addEventListener('input', updateMeter);
+  }
+  document.getElementById('authform').onsubmit = async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const submit = event.currentTarget.querySelector('button[type="submit"],button:not([type])');
+    submit.disabled = true;
+    try {
+      if (isSignup) await signUp(form.get('email'), form.get('password'));
+      else await signIn(form.get('email'), form.get('password'));
+      if (session) { authNotice = ''; await route(); }
+      else viewAuth();
+    } catch (error) { showError(event.currentTarget, error.message); }
+    finally { submit.disabled = false; }
+  };
+}
+
+async function joinLeague(code) {
+  await api('/leagues/join', { method: 'POST', body: { inviteCode: code } });
+  location.hash = '#/';
+  await route();
 }
 
 function showError(form, msg) {
@@ -246,7 +358,7 @@ async function viewLeagues() {
     <div class="card"><h2>My Leagues</h2>
       ${leagues.length ? `<div class="grid card-body">${leagues.map((l) => `
         <a class="card league-card" href="#/league/${l.id}/players"><h3>${logoImg(l, 36)} ${esc(l.name)}</h3>
-        <span class="psub">${esc(l.sport)} &middot; ${esc(l.season)}</span></a>`).join('')}</div>`
+        <span class="psub">${esc(l.sport)} &middot; ${esc(l.season)} ${l.isOwner ? '&middot; Owner' : '&middot; Shared with you'}</span></a>`).join('')}</div>`
         : '<div class="empty">No leagues yet. Create one below.</div>'}
     </div>
     <div class="card"><h2>Create a League</h2><div class="card-body">
@@ -309,7 +421,7 @@ async function viewPlayers(league) {
         <span class="psub"><span class="pos pos-${p.position}">${p.position}</span> ${p.number ? '#' + esc(p.number) : ''}</span></div></div></td>
       <td>${teamTag(p.team)}</td><td>${p.gp}</td>
       ${COLS.map(([k]) => `<td class="${k === 'points' ? 'pts' : ''}">${k === 'points' || k === 'avg' ? f1(colVal(p, k)) : colVal(p, k)}</td>`).join('')}</tr>`).join('')
-      : `<tr><td colspan="${COLS.length + 4}" class="empty">No players. <a href="#/league/${league.id}/add">Add one</a>.</td></tr>`;
+      : `<tr><td colspan="${COLS.length + 4}" class="empty">${league.isOwner ? `No players. <a href="#/league/${league.id}/add">Add one</a>.` : 'No players have been added yet.'}</td></tr>`;
   };
   $app.onclick = (e) => {
     if (e.target.dataset.p) { pos = e.target.dataset.p; render(); }
@@ -344,11 +456,12 @@ async function viewTeams(league) {
   $app.innerHTML = `<div class="card"><h2>Teams</h2>${teams.length ? `<table><thead><tr><th class="left">Team</th><th>Players</th><th>Total FPTS</th></tr></thead><tbody>
     ${teams.map((t) => { const ps = players.filter((p) => p.teamId === t.id); return `<tr><td class="left">${logoImg(t)} ${teamTag(t)} <b>${esc(t.name)}</b></td><td>${ps.length}</td><td class="pts">${f1(ps.reduce((a, p) => a + p.points, 0))}</td></tr>`; }).join('')}
     </tbody></table>` : '<div class="empty">No teams yet.</div>'}</div>
-    <div class="card"><h2>Add Team</h2><div class="card-body"><form id="tform"><div class="row">
+    ${league.isOwner ? `<div class="card"><h2>Add Team</h2><div class="card-body"><form id="tform"><div class="row">
       <label>Name<input name="name" required maxlength="80"></label>
       <label>Abbr<input name="abbr" maxlength="4"></label>
       <label>Color<input type="color" name="color" value="#c8102e"></label>
-      <label>Logo (optional)<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label></div><button class="btn">Add Team</button></form></div></div>`;
+        <label>Logo (optional)<input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></label></div><button class="btn">Add Team</button></form></div></div>` : ''}`;
+      if (!league.isOwner) return;
   document.getElementById('tform').onsubmit = async (e) => {
     e.preventDefault();
     const raw = new FormData(e.target);
@@ -363,6 +476,8 @@ async function viewTeams(league) {
 
 /* ---------- League settings ---------- */
 function viewSettings(league) {
+  if (!league.isOwner) { location.hash = `#/league/${league.id}/players`; return; }
+  inviteUrl = '';
   setNav(league, 'settings');
   $app.innerHTML = `<div class="card"><h2>League Settings</h2><div class="card-body"><form id="setform">
     <div class="row">
@@ -377,12 +492,24 @@ function viewSettings(league) {
     <div class="row">${Object.entries(league.scoring).map(([k, v]) => `<label>${esc(k)}<input type="number" step="any" name="s_${k}" value="${v}"></label>`).join('')}</div>
     <button class="btn">Save Settings</button> <span class="psub">Scoring changes recalculate all fantasy points.</span>
   </form></div></div>
+  <div class="card"><h2>Share League</h2><div class="card-body"><p>People with this invite link can view this league. Only you can edit it.</p>
+    <button class="btn" id="makeinvite">Create / rotate invite link</button><div id="inviteoutput">${inviteUrl ? `<input readonly value="${esc(inviteUrl)}" aria-label="League invite link"> <button class="btn small secondary" id="copyinvite">Copy</button>` : ''}</div>
+    <p class="psub">Rotating the link disables previous links.</p></div></div>
   <div class="card"><h2>Danger Zone</h2><div class="card-body"><button class="btn danger" id="dell">Delete League</button> <span class="psub">Removes the league, its teams, players and stats.</span></div></div>`;
   document.getElementById('dell').onclick = async () => {
     if (!confirm(`Delete league "${league.name}" and all its players?`)) return;
     await api(`/leagues/${league.id}`, { method: 'DELETE' });
     location.hash = '#/';
   };
+  document.getElementById('makeinvite').onclick = async () => {
+    try {
+      const result = await api(`/leagues/${league.id}/invite`, { method: 'POST' });
+      inviteUrl = result.url;
+      document.getElementById('inviteoutput').innerHTML = `<input id="invitefield" readonly value="${esc(inviteUrl)}" aria-label="League invite link"> <button class="btn small secondary" id="copyinvite">Copy</button>`;
+      document.getElementById('copyinvite').onclick = () => navigator.clipboard.writeText(inviteUrl);
+    } catch (error) { showError(document.getElementById('inviteoutput'), error.message); }
+  };
+  document.getElementById('copyinvite')?.addEventListener('click', () => navigator.clipboard.writeText(inviteUrl));
   document.getElementById('setform').onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -400,6 +527,7 @@ function viewSettings(league) {
 
 /* ---------- Add player ---------- */
 async function viewAdd(league) {
+  if (!league.isOwner) { location.hash = `#/league/${league.id}/players`; return; }
   const teams = await api(`/leagues/${league.id}/teams`);
   setNav(league, 'add');
   $app.innerHTML = `<div class="card"><h2>Add Player</h2><div class="card-body"><p class="psub">Step 1: create the player. Step 2: you'll add their stats on the next screen.</p><form id="pform">
@@ -430,6 +558,8 @@ const GAME_COLS = [['passAtt', 'ATT'], ['passCmp', 'CMP'], ['passYd', 'PYD'], ['
 
 async function viewPlayer(pid) {
   const p = await api(`/players/${pid}`);
+  const owner = p.league.isOwner;
+  const teams = owner ? await api(`/leagues/${p.leagueId}/teams`) : [];
   setNav(p.league, 'players');
   const nextWeek = p.games.length ? Math.max(...p.games.map((g) => g.week)) + 1 : 1;
   $app.innerHTML = `
@@ -437,18 +567,42 @@ async function viewPlayer(pid) {
       <div><span class="pos pos-${p.position}">${p.position}</span> ${p.number ? '#' + esc(p.number) : ''} ${teamTag(p.team)}</div>
       <p>${esc(p.bio)}</p></div>
       <div class="stats"><div><b>${f1(p.points)}</b><span>Fantasy Pts</span></div><div><b>${f1(p.avg)}</b><span>Avg</span></div><div><b>${p.gp}</b><span>Games</span></div></div></div>
+    ${owner ? `<div class="card"><div class="card-body"><details><summary><b>Edit Player</b></summary><form id="editp" style="margin-top:12px">
+      <div class="row"><label>Name<input name="name" required maxlength="80" value="${esc(p.name)}"></label>
+      <label>Position<select name="position">${POSITIONS.map((position) => `<option ${position === p.position ? 'selected' : ''}>${position}</option>`).join('')}</select></label>
+      <label>Jersey #<input name="number" maxlength="3" value="${esc(p.number)}"></label>
+      <label>Team (optional)<select name="teamId"><option value="">No team</option>${teams.map((team) => `<option value="${team.id}" ${team.id === p.teamId ? 'selected' : ''}>${esc(team.name)}</option>`).join('')}</select></label>
+      <label>Replace photo<input type="file" name="photo" accept="image/png,image/jpeg,image/webp,image/gif"></label></div>
+      ${p.photo ? '<label style="display:inline-flex;flex-direction:row;align-items:center;gap:6px;margin-bottom:12px"><input type="checkbox" name="removePhoto"> Remove current photo</label>' : ''}
+      <label style="margin-bottom:12px">Bio<textarea name="bio" maxlength="300" rows="2">${esc(p.bio)}</textarea></label>
+      <button class="btn">Save Player</button></form></details></div></div>` : ''}
     <div class="card"><h2>Game Log</h2>${p.games.length ? `<div class="scroll"><table><thead><tr><th class="left">Wk</th><th class="left">Opp</th>
-      ${GAME_COLS.map(([, l]) => `<th>${l}</th>`).join('')}<th>FPTS</th><th></th></tr></thead><tbody>
+      ${GAME_COLS.map(([, l]) => `<th>${l}</th>`).join('')}<th>FPTS</th>${owner ? '<th></th>' : ''}</tr></thead><tbody>
       ${p.games.map((g) => `<tr><td class="left">${g.week}</td><td class="left">${esc(g.opponent) || '-'}</td>${GAME_COLS.map(([k]) => `<td>${g[k]}</td>`).join('')}
-        <td class="pts">${f1(g.points)}</td><td><button class="btn small danger" data-del="${g.id}">✕</button></td></tr>`).join('')}
-      <tr><td class="left" colspan="2"><b>Total</b></td>${GAME_COLS.map(([k]) => `<td><b>${p.totals[k]}</b></td>`).join('')}<td class="pts">${f1(p.points)}</td><td></td></tr>
+        <td class="pts">${f1(g.points)}</td>${owner ? `<td><button class="btn small danger" data-del="${g.id}">✕</button></td>` : ''}</tr>`).join('')}
+      <tr><td class="left" colspan="2"><b>Total</b></td>${GAME_COLS.map(([k]) => `<td><b>${p.totals[k]}</b></td>`).join('')}<td class="pts">${f1(p.points)}</td>${owner ? '<td></td>' : ''}</tr>
       </tbody></table></div>` : '<div class="empty">No stat lines yet.</div>'}</div>
-    <div class="card"><div class="card-head">Add / Update Stat Line <a class="btn small" href="#/league/${p.leagueId}/add">+ Add Another Player</a></div><div class="card-body"><form id="sform">
+    ${owner ? `<div class="card"><div class="card-head">Add / Update Stat Line <a class="btn small" href="#/league/${p.leagueId}/add">+ Add Another Player</a></div><div class="card-body"><form id="sform">
       <div class="row"><label>Week<input type="number" name="week" min="1" max="99" value="${nextWeek}" required></label>
       <label>Opponent<input name="opponent" maxlength="30"></label></div>
       <div class="row">${GAME_COLS.map(([k, l]) => `<label>${l}<input type="number" name="${k}" value="0" step="1"></label>`).join('')}</div>
       <button class="btn">Save Stat Line</button> <span class="psub">Saving an existing week replaces it.</span></form></div></div>
-    <button class="btn danger" id="delp">Delete Player</button>`;
+    <button class="btn danger" id="delp">Delete Player</button>` : '<p class="psub">Shared view · only the league owner can edit player details or stats.</p>'}`;
+  if (!owner) return;
+  document.getElementById('editp').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = Object.fromEntries([...fd].filter(([key]) => !['photo', 'removePhoto'].includes(key)));
+    body.teamId = fd.get('teamId') || null;
+    try {
+      const image = fd.get('photo');
+      if (image?.size) body.photo = await fileToDataUrl(image);
+      else if (fd.get('removePhoto')) body.photo = null;
+      else delete body.photo;
+      await api(`/players/${pid}`, { method: 'PUT', body });
+      viewPlayer(pid);
+    } catch (error) { showError(e.target, error.message); }
+  };
   document.getElementById('sform').onsubmit = async (e) => {
     e.preventDefault();
     try { await api(`/players/${pid}/stats`, { method: 'POST', body: Object.fromEntries(new FormData(e.target)) }); viewPlayer(pid); } catch (err) { showError(e.target, err.message); }
@@ -466,9 +620,12 @@ async function viewPlayer(pid) {
 /* ---------- Router ---------- */
 async function route() {
   $app.onclick = null;
-  if (!meta) meta = await api('/meta');
-  const parts = location.hash.replace(/^#\/?/, '').split('/');
   try {
+    if (!configured()) { viewSetup(); return; }
+    if (!session) { viewAuth(); return; }
+    if (!meta) meta = await api('/meta');
+    const parts = location.hash.replace(/^#\/?/, '').split('/');
+    if (parts[0] === 'join' && parts[1]) { await joinLeague(parts[1]); return; }
     if (parts[0] === 'league' && parts[1]) {
       const league = (await api('/leagues')).find((l) => l.id === parts[1]);
       if (!league) return (location.hash = '#/');
@@ -485,14 +642,9 @@ async function route() {
 }
 
 window.addEventListener('hashchange', route);
-if (!USE_SERVER_API) {
-  document.getElementById('staticNotice').hidden = false;
-  document.getElementById('exportData').onclick = downloadBackup;
-  document.getElementById('importData').onchange = async (event) => {
-    const file = event.target.files[0];
-    if (!file || !confirm('Importing a backup replaces the data saved in this browser. Continue?')) return;
-    try { await importBackup(file); } catch (error) { alert(error.message); }
-    event.target.value = '';
-  };
+async function initialize() {
+  if (!configured()) { viewSetup(); return; }
+  try { await restoreSession(); } catch (error) { authNotice = error.message; }
+  await route();
 }
-route();
+initialize();
