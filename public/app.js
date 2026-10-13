@@ -83,9 +83,35 @@ async function signIn(email, password) {
 
 async function signUp(email, password) {
   if (!passwordChecks(password).every(Boolean)) throw new Error('Use at least 12 characters with uppercase, lowercase, a number, and a symbol.');
-  const data = await authRequest('signup', { email, password });
+  const redirectTo = new URL(location.href);
+  redirectTo.hash = '';
+  redirectTo.search = '';
+  const data = await authRequest(`signup?redirect_to=${encodeURIComponent(redirectTo.href)}`, { email, password });
   if (data.access_token) saveSession({ ...data, expires_at: Date.now() / 1000 + (data.expires_in || 3600) });
   else authNotice = 'Check your email to confirm your account, then sign in.';
+}
+
+async function completeAuthRedirect() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const queryParams = new URLSearchParams(location.search);
+  const errorDescription = params.get('error_description') || queryParams.get('error_description');
+  if (errorDescription) {
+    authNotice = errorDescription.replaceAll('+', ' ');
+    history.replaceState(null, '', `${location.pathname}${location.search}`);
+    return;
+  }
+  const accessToken = params.get('access_token') || queryParams.get('access_token');
+  const refreshToken = params.get('refresh_token') || queryParams.get('refresh_token');
+  if (!accessToken || !refreshToken) return;
+  const response = await fetch(`${APP_CONFIG.supabaseUrl}/auth/v1/user`, {
+    headers: { apikey: APP_CONFIG.supabaseAnonKey, Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) throw new Error('Email confirmation succeeded, but sign-in could not be completed. Please sign in.');
+  const user = await response.json();
+  const expiresIn = Number(params.get('expires_in') || queryParams.get('expires_in')) || 3600;
+  saveSession({ access_token: accessToken, refresh_token: refreshToken, token_type: params.get('token_type') || queryParams.get('token_type') || 'bearer',
+    expires_in: expiresIn, expires_at: Number(params.get('expires_at') || queryParams.get('expires_at')) || Date.now() / 1000 + expiresIn, user });
+  history.replaceState(null, '', location.pathname);
 }
 
 function passwordChecks(password) {
@@ -644,6 +670,7 @@ async function route() {
 window.addEventListener('hashchange', route);
 async function initialize() {
   if (!configured()) { viewSetup(); return; }
+  try { await completeAuthRedirect(); } catch (error) { authNotice = error.message; }
   try { await restoreSession(); } catch (error) { authNotice = error.message; }
   await route();
 }
